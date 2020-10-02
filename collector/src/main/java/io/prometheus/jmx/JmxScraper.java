@@ -6,20 +6,29 @@ import javax.management.JMException;
 import javax.management.MBeanAttributeInfo;
 import javax.management.MBeanInfo;
 import javax.management.MBeanServerConnection;
+import javax.management.Notification;
+import javax.management.NotificationListener;
 import javax.management.ObjectInstance;
 import javax.management.ObjectName;
 import javax.management.openmbean.CompositeData;
 import javax.management.openmbean.CompositeType;
 import javax.management.openmbean.TabularData;
 import javax.management.openmbean.TabularType;
+import javax.management.remote.JMXConnectionNotification;
 import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
 import javax.management.remote.rmi.RMIConnectorServer;
 import javax.naming.Context;
 import javax.rmi.ssl.SslRMIClientSocketFactory;
+
+import io.prometheus.jmx.JmxMBeanPropertyCache.MBeanAttributeInfoWrapper;
+
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.net.MalformedURLException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -37,7 +46,7 @@ class JmxScraper {
 
 
     public static interface MBeanReceiver {
-        void recordBean(
+        boolean recordBean(
             String domain,
             LinkedHashMap<String, String> beanProperties,
             LinkedList<String> attrKeys,
@@ -47,35 +56,41 @@ class JmxScraper {
             Object value);
     }
 
-    private final MBeanReceiver receiver;
     private final String jmxUrl;
     private final String username;
     private final String password;
     private final boolean ssl;
     private final List<ObjectName> whitelistObjectNames, blacklistObjectNames;
+    private boolean detectUnusedJmxAttributes;
     private final JmxMBeanPropertyCache jmxMBeanPropertyCache;
+
+    private MBeanServerConnection beanConn;
+    private JMXConnector jmxc = null;
 
     public JmxScraper(String jmxUrl, String username, String password, boolean ssl,
                       List<ObjectName> whitelistObjectNames, List<ObjectName> blacklistObjectNames,
-                      MBeanReceiver receiver, JmxMBeanPropertyCache jmxMBeanPropertyCache) {
+                      JmxMBeanPropertyCache jmxMBeanPropertyCache) {
+        this(jmxUrl, username, password, ssl, whitelistObjectNames, blacklistObjectNames, false, jmxMBeanPropertyCache);
+    }
+
+    public JmxScraper(String jmxUrl, String username, String password, boolean ssl,
+            List<ObjectName> whitelistObjectNames, List<ObjectName> blacklistObjectNames,
+            boolean detectUnusedJmxAttributes, JmxMBeanPropertyCache jmxMBeanPropertyCache) {
         this.jmxUrl = jmxUrl;
-        this.receiver = receiver;
         this.username = username;
         this.password = password;
         this.ssl = ssl;
         this.whitelistObjectNames = whitelistObjectNames;
         this.blacklistObjectNames = blacklistObjectNames;
+        this.detectUnusedJmxAttributes = detectUnusedJmxAttributes;
         this.jmxMBeanPropertyCache = jmxMBeanPropertyCache;
     }
 
     /**
-      * Get a list of mbeans on host_port and scrape their values.
-      *
-      * Values are passed to the receiver in a single thread.
-      */
-    public void doScrape() throws Exception {
-        MBeanServerConnection beanConn;
-        JMXConnector jmxc = null;
+     * Handles (re)connection to MBean server
+     */
+    private synchronized void connect() throws IOException, MalformedURLException {
+        if (jmxc != null) return;
         if (jmxUrl.isEmpty()) {
           beanConn = ManagementFactory.getPlatformMBeanServer();
         } else {
@@ -93,82 +108,130 @@ class JmxScraper {
 
           jmxc = JMXConnectorFactory.connect(new JMXServiceURL(jmxUrl), environment);
           beanConn = jmxc.getMBeanServerConnection();
-        }
-        try {
-            // Query MBean names, see #89 for reasons queryMBeans() is used instead of queryNames()
-            Set<ObjectName> mBeanNames = new HashSet<ObjectName>();
-            for (ObjectName name : whitelistObjectNames) {
-                for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
-                    mBeanNames.add(instance.getObjectName());
+          
+          jmxc.addConnectionNotificationListener(new NotificationListener() {
+            @Override
+            public void handleNotification(Notification notification, Object handback) {
+                JMXConnectionNotification not = (JMXConnectionNotification) notification;
+                if (JMXConnectionNotification.CLOSED.equals(not.getType())
+                        || JMXConnectionNotification.FAILED.equals(not.getType())) {
+                    if (logger.isLoggable(Level.FINE)) logger.fine("JMX connection closed. Forcing reconnection.");
+                    try {
+                        jmxc.close();
+                    } catch (Exception e) {
+                        // Silence
+                    }
+                    jmxc = null;
+                    beanConn = null;
                 }
             }
-
-            for (ObjectName name : blacklistObjectNames) {
-                for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
-                    mBeanNames.remove(instance.getObjectName());
-                }
-            }
-
-            // Now that we have *only* the whitelisted mBeans, remove any old ones from the cache:
-            jmxMBeanPropertyCache.onlyKeepMBeans(mBeanNames);
-
-            for (ObjectName objectName : mBeanNames) {
-                long start = System.nanoTime();
-                scrapeBean(beanConn, objectName);
-                logger.fine("TIME: " + (System.nanoTime() - start) + " ns for " + objectName.toString());
-            }
-        } finally {
-          if (jmxc != null) {
-            jmxc.close();
-          }
+          }, null, null);
         }
     }
 
-    private void scrapeBean(MBeanServerConnection beanConn, ObjectName mbeanName) {
-        MBeanInfo info;
-        try {
-          info = beanConn.getMBeanInfo(mbeanName);
-        } catch (IOException e) {
-          logScrape(mbeanName.toString(), "getMBeanInfo Fail: " + e);
-          return;
-        } catch (JMException e) {
-          logScrape(mbeanName.toString(), "getMBeanInfo Fail: " + e);
-          return;
+    /**
+      * If no connection available, (re)connects.
+      */
+    private void connectEventually() throws MalformedURLException, IOException {
+        if (jmxc == null) {
+            connect();
         }
-        MBeanAttributeInfo[] attrInfos = info.getAttributes();
+    }
 
-        Map<String, MBeanAttributeInfo> name2AttrInfo = new LinkedHashMap<String, MBeanAttributeInfo>();
-        for (int idx = 0; idx < attrInfos.length; ++idx) {
-            MBeanAttributeInfo attr = attrInfos[idx];
-            if (!attr.isReadable()) {
-                logScrape(mbeanName, attr, "not readable");
-                continue;
+    /**
+      * Get a list of mbeans on host_port and scrape their values.
+      *
+      * Values are passed to the receiver in a single thread.
+      */
+    public void doScrape(MBeanReceiver receiver) throws Exception {
+        connectEventually();
+
+        // Query MBean names, see #89 for reasons queryMBeans() is used instead of queryNames()
+        Set<ObjectName> mBeanNames = new HashSet<ObjectName>();
+        for (ObjectName name : whitelistObjectNames) {
+            for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
+                mBeanNames.add(instance.getObjectName());
             }
-            name2AttrInfo.put(attr.getName(), attr);
         }
-        final AttributeList attributes;
-        try {
-            attributes = beanConn.getAttributes(mbeanName, name2AttrInfo.keySet().toArray(new String[0]));
-            if (attributes == null) {
-                logScrape(mbeanName.toString(), "getAttributes Fail: attributes are null");
+
+        for (ObjectName name : blacklistObjectNames) {
+            for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
+                mBeanNames.remove(instance.getObjectName());
+            }
+        }
+
+        // Now that we have *only* the whitelisted mBeans, remove any old ones from the cache:
+        jmxMBeanPropertyCache.onlyKeepMBeans(mBeanNames);
+
+        for (ObjectName objectName : mBeanNames) {
+            long start = System.nanoTime();
+            scrapeBean(beanConn, receiver, objectName);
+            if (logger.isLoggable(Level.FINE)) logger.fine("TIME: " + (System.nanoTime() - start) + " ns for " + objectName.toString());
+        }
+    }
+
+    private void scrapeBean(MBeanServerConnection beanConn, MBeanReceiver receiver, ObjectName mbeanName) {
+        Map<String, MBeanAttributeInfoWrapper> name2AttrInfo = jmxMBeanPropertyCache.getAttrInfo(mbeanName);
+
+        if (name2AttrInfo == null) {
+            MBeanInfo info;
+            try {
+              info = beanConn.getMBeanInfo(mbeanName);
+            } catch (IOException e) {
+              if (logger.isLoggable(Level.FINE)) logScrape(mbeanName.toString(), "getMBeanInfo Fail: " + e);
+              return;
+            } catch (JMException e) {
+              if (logger.isLoggable(Level.FINE)) logScrape(mbeanName.toString(), "getMBeanInfo Fail: " + e);
+              return;
+            }
+
+            MBeanAttributeInfo[] attrInfos = info.getAttributes();
+    
+            name2AttrInfo = new LinkedHashMap<String, MBeanAttributeInfoWrapper>();
+            for (int idx = 0; idx < attrInfos.length; ++idx) {
+                MBeanAttributeInfo attr = attrInfos[idx];
+                if (!attr.isReadable()) {
+                    if (logger.isLoggable(Level.FINE)) logScrape(mbeanName, attr, "not readable");
+                    continue;
+                }
+                name2AttrInfo.put(attr.getName(), new MBeanAttributeInfoWrapper(attr));
+            }
+
+            jmxMBeanPropertyCache.cacheAttrInfo(mbeanName, name2AttrInfo);
+        }
+
+        ArrayList<String> attributesNames = new ArrayList<String>();
+        for (Map.Entry<String, MBeanAttributeInfoWrapper> entry: name2AttrInfo.entrySet()) {
+            if (! this.detectUnusedJmxAttributes || entry.getValue().usedAtLastScrape) attributesNames.add(entry.getKey());
+        }
+
+        if (! attributesNames.isEmpty()) {
+            final AttributeList attributes;
+            try {
+                attributes = beanConn.getAttributes(mbeanName, attributesNames.toArray(new String[attributesNames.size()]));
+                if (attributes == null) {
+                    if (logger.isLoggable(Level.FINE)) logScrape(mbeanName.toString(), "getAttributes Fail: attributes are null");
+                    return;
+                }
+            } catch (Exception e) {
+                if (logger.isLoggable(Level.FINE)) logScrape(mbeanName, attributesNames, "Fail: " + e);
                 return;
             }
-        } catch (Exception e) {
-            logScrape(mbeanName, name2AttrInfo.keySet(), "Fail: " + e);
-            return;
-        }
-        for (Attribute attribute : attributes.asList()) {
-            MBeanAttributeInfo attr = name2AttrInfo.get(attribute.getName());
-            logScrape(mbeanName, attr, "process");
-            processBeanValue(
-                    mbeanName.getDomain(),
-                    jmxMBeanPropertyCache.getKeyPropertyList(mbeanName),
-                    new LinkedList<String>(),
-                    attr.getName(),
-                    attr.getType(),
-                    attr.getDescription(),
-                    attribute.getValue()
-            );
+    
+            for (Attribute attribute : attributes.asList()) {
+                final MBeanAttributeInfoWrapper attrWithActivation = name2AttrInfo.get(attribute.getName());
+                MBeanAttributeInfo attr = attrWithActivation.info;
+                if (logger.isLoggable(Level.FINE)) logScrape(mbeanName, attr, "process");
+                attrWithActivation.usedAtLastScrape = processBeanValue(
+                        receiver,
+                        mbeanName.getDomain(),
+                        jmxMBeanPropertyCache.getKeyPropertyList(mbeanName),
+                        new LinkedList<String>(),
+                        attr.getName(),
+                        attr.getType(),
+                        attr.getDescription(),
+                        attribute.getValue());
+            }
         }
     }
 
@@ -180,7 +243,8 @@ class JmxScraper {
      * so this function tries to do a best-effort pass of getting the values/names
      * out in a way it can be processed elsewhere easily.
      */
-    private void processBeanValue(
+    private boolean processBeanValue(
+            MBeanReceiver receiver,
             String domain,
             LinkedHashMap<String, String> beanProperties,
             LinkedList<String> attrKeys,
@@ -188,15 +252,17 @@ class JmxScraper {
             String attrType,
             String attrDescription,
             Object value) {
+        boolean result = false;
         if (value == null) {
-            logScrape(domain + beanProperties + attrName, "null");
+            if (logger.isLoggable(Level.FINE)) logScrape(domain + beanProperties + attrName, "null");
+            result = true;
         } else if (value instanceof Number || value instanceof String || value instanceof Boolean || value instanceof java.util.Date) {
             if (value instanceof java.util.Date) {
                 attrType = "java.lang.Double";
                 value = ((java.util.Date) value).getTime() / 1000.0;
             }
-            logScrape(domain + beanProperties + attrName, value.toString());
-            this.receiver.recordBean(
+            if (logger.isLoggable(Level.FINE)) logScrape(domain + beanProperties + attrName, value.toString());
+            result = receiver.recordBean(
                     domain,
                     beanProperties,
                     attrKeys,
@@ -205,7 +271,7 @@ class JmxScraper {
                     attrDescription,
                     value);
         } else if (value instanceof CompositeData) {
-            logScrape(domain + beanProperties + attrName, "compositedata");
+            if (logger.isLoggable(Level.FINE)) logScrape(domain + beanProperties + attrName, "compositedata");
             CompositeData composite = (CompositeData) value;
             CompositeType type = composite.getCompositeType();
             attrKeys = new LinkedList<String>(attrKeys);
@@ -213,7 +279,8 @@ class JmxScraper {
             for(String key : type.keySet()) {
                 String typ = type.getType(key).getTypeName();
                 Object valu = composite.get(key);
-                processBeanValue(
+                boolean intermediateResult = processBeanValue(
+                        receiver,
                         domain,
                         beanProperties,
                         attrKeys,
@@ -221,6 +288,7 @@ class JmxScraper {
                         typ,
                         type.getDescription(),
                         valu);
+                result = intermediateResult || result;
             }
         } else if (value instanceof TabularData) {
             // I don't pretend to have a good understanding of TabularData.
@@ -228,7 +296,7 @@ class JmxScraper {
             // meant to be used according to the docs. I've only seen them
             // used as 'key' 'value' pairs even when 'value' is itself a
             // CompositeData of multiple values.
-            logScrape(domain + beanProperties + attrName, "tabulardata");
+            if (logger.isLoggable(Level.FINE)) logScrape(domain + beanProperties + attrName, "tabulardata");
             TabularData tds = (TabularData) value;
             TabularType tt = tds.getTabularType();
 
@@ -264,7 +332,8 @@ class JmxScraper {
                             attrNames = attrKeys;
                             name = attrName;
                         } 
-                        processBeanValue(
+                        boolean intermediateResult = processBeanValue(
+                            receiver,
                             domain,
                             l2s,
                             attrNames,
@@ -272,22 +341,26 @@ class JmxScraper {
                             typ,
                             type.getDescription(),
                             composite.get(valueIdx));
+                        result = intermediateResult || result;
                     }
                 } else {
-                    logScrape(domain, "not a correct tabulardata format");
+                    if (logger.isLoggable(Level.FINE)) logScrape(domain, "not a correct tabulardata format");
                 }
             }
         } else if (value.getClass().isArray()) {
-            logScrape(domain, "arrays are unsupported");
+            if (logger.isLoggable(Level.FINE)) logScrape(domain, "arrays are unsupported");
+            result = false;
         } else {
-            logScrape(domain + beanProperties, attrType + " is not exported");
+            if (logger.isLoggable(Level.FINE)) logScrape(domain + beanProperties, attrType + " is not exported");
+            result = false;
         }
+        return result;
     }
 
     /**
      * For debugging.
      */
-    private static void logScrape(ObjectName mbeanName, Set<String> names, String msg) {
+    private static void logScrape(ObjectName mbeanName, Collection<String> names, String msg) {
         logScrape(mbeanName + "_" + names, msg);
     }
     private static void logScrape(ObjectName mbeanName, MBeanAttributeInfo attr, String msg) {
@@ -298,7 +371,7 @@ class JmxScraper {
     }
 
     private static class StdoutWriter implements MBeanReceiver {
-        public void recordBean(
+        public boolean recordBean(
             String domain,
             LinkedHashMap<String, String> beanProperties,
             LinkedList<String> attrKeys,
@@ -311,6 +384,7 @@ class JmxScraper {
                                attrKeys +
                                attrName +
                                ": " + value);
+            return true;
         }
     }
 
@@ -322,15 +396,15 @@ class JmxScraper {
       objectNames.add(null);
       if (args.length >= 3){
             new JmxScraper(args[0], args[1], args[2], false, objectNames, new LinkedList<ObjectName>(),
-                    new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
+                  new JmxMBeanPropertyCache()).doScrape(new StdoutWriter());
         }
       else if (args.length > 0){
           new JmxScraper(args[0], "", "", false, objectNames, new LinkedList<ObjectName>(),
-                  new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
+                  new JmxMBeanPropertyCache()).doScrape(new StdoutWriter());
       }
       else {
           new JmxScraper("", "", "", false, objectNames, new LinkedList<ObjectName>(),
-                  new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
+                  new JmxMBeanPropertyCache()).doScrape(new StdoutWriter());
       }
     }
 }

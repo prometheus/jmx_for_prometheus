@@ -11,6 +11,7 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -19,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -59,6 +61,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
       boolean ssl = false;
       boolean lowercaseOutputName;
       boolean lowercaseOutputLabelNames;
+      boolean detectUnusedJmxAttributes;
       List<ObjectName> whitelistObjectNames = new ArrayList<ObjectName>();
       List<ObjectName> blacklistObjectNames = new ArrayList<ObjectName>();
       List<Rule> rules = new ArrayList<Rule>();
@@ -71,20 +74,25 @@ public class JmxCollector extends Collector implements Collector.Describable {
     private File configFile;
     private long createTimeNanoSecs = System.nanoTime();
 
-    private final JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
+    private JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
 
     public JmxCollector(File in) throws IOException, MalformedObjectNameException {
+        this((Map<String, Object>)new Yaml().load(new FileReader(in)));
         configFile = in;
-        config = loadConfig((Map<String, Object>)new Yaml().load(new FileReader(in)));
         config.lastUpdate = configFile.lastModified();
     }
 
     public JmxCollector(String yamlConfig) throws MalformedObjectNameException {
-      config = loadConfig((Map<String, Object>)new Yaml().load(yamlConfig));
+        this((Map<String, Object>)new Yaml().load(yamlConfig));
     }
 
     public JmxCollector(InputStream inputStream) throws MalformedObjectNameException {
-      config = loadConfig((Map<String, Object>)new Yaml().load(inputStream));
+        this((Map<String, Object>)new Yaml().load(inputStream));
+    }
+
+    private JmxCollector(Map<String, Object> load) throws MalformedObjectNameException {
+        config = loadConfig(load);
+        createScraper();
     }
 
     private void reloadConfig() {
@@ -96,6 +104,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
           config = loadConfig(newYamlConfig);
           config.lastUpdate = configFile.lastModified();
           configReloadSuccess.inc();
+          createScraper();
         } catch (Exception e) {
           LOGGER.severe("Configuration reload failed: " + e.toString());
           configReloadFailure.inc();
@@ -162,6 +171,10 @@ public class JmxCollector extends Collector implements Collector.Describable {
 
         if (yamlConfig.containsKey("lowercaseOutputLabelNames")) {
           cfg.lowercaseOutputLabelNames = (Boolean)yamlConfig.get("lowercaseOutputLabelNames");
+        }
+
+        if (yamlConfig.containsKey("detectUnusedJmxAttributes")) {
+          cfg.detectUnusedJmxAttributes = (Boolean)yamlConfig.get("detectUnusedJmxAttributes");
         }
 
         if (yamlConfig.containsKey("whitelistObjectNames")) {
@@ -242,6 +255,15 @@ public class JmxCollector extends Collector implements Collector.Describable {
 
         return cfg;
 
+    }
+
+    /**
+     * Creates JMX Scraper
+     */
+    private void createScraper() {
+        jmxMBeanPropertyCache.onlyKeepMBeans(Collections.<ObjectName>emptySet());
+        scraper = new JmxScraper(config.jmxUrl, config.username, config.password, config.ssl,
+                config.whitelistObjectNames, config.blacklistObjectNames, config.detectUnusedJmxAttributes, jmxMBeanPropertyCache);
     }
 
     static String toSnakeAndLowerCase(String attrName) {
@@ -390,7 +412,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
         return new MatchedRule(fullname, matchName, type, help, labelNames, labelValues, value, valueFactor);
       }
 
-      public void recordBean(
+      public boolean recordBean(
           String domain,
           LinkedHashMap<String, String> beanProperties,
           LinkedList<String> attrKeys,
@@ -444,7 +466,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
               value = Double.valueOf(val);
             } catch (NumberFormatException e) {
               LOGGER.fine("Unable to parse configured value '" + val + "' to number for bean: " + beanName + attrName + ": " + beanValue);
-              return;
+              return true;
             }
           }
 
@@ -458,7 +480,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
           // Matcher is set below here due to validation in the constructor.
           String name = safeName(matcher.replaceAll(rule.name));
           if (name.isEmpty()) {
-            return;
+            return true;
           }
           if (config.lowercaseOutputName) {
             name = name.toLowerCase();
@@ -499,7 +521,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
         }
 
         if (matchedRule.isUnmatched()) {
-          return;
+          return false;
         }
 
         Number value;
@@ -512,17 +534,18 @@ public class JmxCollector extends Collector implements Collector.Describable {
         } else if (beanValue instanceof Boolean) {
           value = (Boolean) beanValue ? 1 : 0;
         } else {
-          LOGGER.fine("Ignoring unsupported bean: " + beanName + attrName + ": " + beanValue);
-          return;
+          if (LOGGER.isLoggable(Level.FINE)) LOGGER.fine("Ignoring unsupported bean: " + beanName + attrName + ": " + beanValue);
+          return false;
         }
 
         // Add to samples.
-        LOGGER.fine("add metric sample: " + matchedRule.name + " " + matchedRule.labelNames + " " + matchedRule.labelValues + " " + value.doubleValue());
+        if (LOGGER.isLoggable(Level.FINE)) LOGGER.fine("add metric sample: " + matchedRule.name + " " + matchedRule.labelNames + " " + matchedRule.labelValues + " " + value.doubleValue());
         addSample(new MetricFamilySamples.Sample(matchedRule.name, matchedRule.labelNames, matchedRule.labelValues, value.doubleValue()), matchedRule.type, help);
+        return true;
       }
-
     }
 
+    JmxScraper scraper;
   public List<MetricFamilySamples> collect() {
       // Take a reference to the current config and collect with this one
       // (to avoid race conditions in case another thread reloads the config in the meantime)
@@ -530,8 +553,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
 
       MatchedRulesCache.StalenessTracker stalenessTracker = new MatchedRulesCache.StalenessTracker();
       Receiver receiver = new Receiver(config, stalenessTracker);
-      JmxScraper scraper = new JmxScraper(config.jmxUrl, config.username, config.password, config.ssl,
-              config.whitelistObjectNames, config.blacklistObjectNames, receiver, jmxMBeanPropertyCache);
+
       long start = System.nanoTime();
       double error = 0;
       if ((config.startDelaySeconds > 0) &&
@@ -539,7 +561,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
         throw new IllegalStateException("JMXCollector waiting for startDelaySeconds");
       }
       try {
-        scraper.doScrape();
+        scraper.doScrape(receiver);
       } catch (Exception e) {
         error = 1;
         StringWriter sw = new StringWriter();
