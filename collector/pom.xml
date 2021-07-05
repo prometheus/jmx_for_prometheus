@@ -30,6 +30,12 @@
       <artifactId>snakeyaml</artifactId>
       <version>1.23</version> <!-- required for the Java 6 release -->
     </dependency>
+    <dependency>
+      <groupId>com.github.stefanbirkner</groupId>
+      <artifactId>system-rules</artifactId>
+      <version>1.18.0</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
